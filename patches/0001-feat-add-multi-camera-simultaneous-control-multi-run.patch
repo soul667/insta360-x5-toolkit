@@ -1,0 +1,1170 @@
+From bc2221c1b3374700d6197af8e4b5ebac2925da21 Mon Sep 17 00:00:00 2001
+From: ShengzheGAN <shengzhegan04@gmail.com>
+Date: Fri, 9 Oct 2026 14:26:53 +0800
+Subject: [PATCH 1/5] feat: add multi-camera simultaneous control (multi run /
+ multi shell)
+
+One process keeps BLE connections to several cameras open and dispatches
+commands from a shared barrier (pkg/multi.FanOut). Every broadcast reports
+per-camera dispatch offsets, RTTs and the overall dispatch spread, making
+sync quality measurable instead of assumed. Includes unit tests and
+doc/multi_camera.md.
+---
+ README.md                    |  36 +++
+ cmd/insta360ctl/cmd_multi.go | 501 +++++++++++++++++++++++++++++++++++
+ cmd/insta360ctl/main.go      |   1 +
+ doc/multi_camera.md          | 110 ++++++++
+ pkg/multi/multi.go           | 364 +++++++++++++++++++++++++
+ pkg/multi/multi_test.go      |  85 ++++++
+ 6 files changed, 1097 insertions(+)
+ create mode 100644 cmd/insta360ctl/cmd_multi.go
+ create mode 100644 doc/multi_camera.md
+ create mode 100644 pkg/multi/multi.go
+ create mode 100644 pkg/multi/multi_test.go
+
+diff --git a/README.md b/README.md
+index 0f44d38..659fd69 100644
+--- a/README.md
++++ b/README.md
+@@ -78,6 +78,42 @@ sudo insta360ctl direct power-off
+ sudo insta360ctl direct --addr AA:BB:CC:DD:EE:FF shutter
+ ```
+ 
++### Multiple Cameras Simultaneously (e.g. two X5s)
++
++One process, one BLE adapter, all cameras triggered from a shared barrier.
++Connections stay open for the whole session, so commands reach every camera
++within the reported dispatch spread (typically single-digit milliseconds
++with the D-Bus backend).
++
++```bash
++# One command for all cameras; prints per-camera dispatch offsets and RTTs
++sudo insta360ctl multi run --addr AA:BB:CC:DD:EE:FF --addr 11:22:33:44:55:66 record start
++
++# Fire-and-forget (no acknowledgment wait) for the tightest dispatch
++sudo insta360ctl multi run --addr AA:BB --addr CC:DD --no-wait record stop
++
++# Connect now, fire 5 seconds later
++sudo insta360ctl multi run --addr AA:BB --addr CC:DD --delay 5s record start
++
++# Or keep a session open and drive all cameras from the prompt
++sudo insta360ctl multi shell --addr AA:BB --addr CC:DD
++x5> mode video
++x5> start
++x5> start 5s       # synchronized fire with a countdown
++x5> stop
++x5> status
++x5> quit
++
++# --all attaches to every Insta360 camera in range during the scan window
++sudo insta360ctl multi shell --all --scan-window 5s
++```
++
++`multi` synchronizes *command dispatch*, not sensor exposure: the BLE
++command reaches both cameras within the printed dispatch spread, but each
++camera then takes its own internal time to start the pipeline. Verify the
++real offset with a clap/LED marker and correct it in post. See
++[doc/multi_camera.md](doc/multi_camera.md) for details.
++
+ ### GPS Remote (Architecture A)
+ 
+ ```bash
+diff --git a/cmd/insta360ctl/cmd_multi.go b/cmd/insta360ctl/cmd_multi.go
+new file mode 100644
+index 0000000..bab956f
+--- /dev/null
++++ b/cmd/insta360ctl/cmd_multi.go
+@@ -0,0 +1,501 @@
++package main
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/urfave/cli/v2"
++	"github.com/xaionaro-go/insta360ctl/pkg/camera"
++	"github.com/xaionaro-go/insta360ctl/pkg/direct"
++	"github.com/xaionaro-go/insta360ctl/pkg/multi"
++	"github.com/xaionaro-go/insta360ctl/pkg/protocol/messagecode"
++)
++
++const shellHelpText = `Commands:
++  start [delay]           start recording on all cameras (optional delay, e.g. 5s)
++  stop [delay]            stop recording on all cameras
++  photo                   take a photo on all cameras
++  marker                  set a highlight marker in the current recording
++  mode <m>                set capture mode (photo|video|timelapse|hdr|bullettime)
++  hdr <on|off>            toggle HDR
++  gps <lat> <lon> <alt>   inject GPS coordinates
++  battery | storage | status | info | state   query each camera
++  raw <cmd-hex> [param-hex ...]   send a raw command to each camera
++  devices                 list connected cameras
++  help                    show this help
++  quit                    disconnect and exit`
++
++func cmdMulti() *cli.Command {
++	return &cli.Command{
++		Name:  "multi",
++		Usage: "Control multiple Insta360 cameras simultaneously over one BLE adapter",
++		Description: `Connects to several cameras in one process, keeps all BLE links open, and
++fires every command from a shared barrier so the cameras are triggered as
++simultaneously as the BLE stack allows. Every broadcast prints per-camera
++dispatch offsets and round-trip times, plus the dispatch spread, so the
++synchronization quality is measured instead of assumed.
++
++NOTE: this synchronizes command dispatch, not sensor exposure. Each camera
++needs its own internal time to start the pipeline; verify the real offset
++with a clap/LED marker and correct it in post (see doc/multi_camera.md).`,
++		Subcommands: []*cli.Command{
++			{
++				Name:      "run",
++				Usage:     "Connect to all given cameras, fire one command on all of them, then disconnect",
++				ArgsUsage: "<record start|record stop|start|stop|photo|marker|mode <m>|hdr <on|off>|gps <lat> <lon> <alt>|battery|storage|status|info|state|power-off>",
++				Flags: append(commonMultiFlags(),
++					&cli.DurationFlag{
++						Name:  "delay",
++						Value: 0,
++						Usage: "Fire the command this long after connecting (e.g. 5s), so you can get ready",
++					},
++					&cli.BoolFlag{
++						Name:  "no-wait",
++						Usage: "Do not wait for the camera acknowledgment (write without response)",
++					},
++				),
++				Action: multiRun,
++			},
++			{
++				Name:  "shell",
++				Usage: "Keep connections to all cameras open and fire commands interactively",
++				Flags: commonMultiFlags(),
++				Action: multiShell,
++			},
++		},
++	}
++}
++
++func commonMultiFlags() []cli.Flag {
++	return []cli.Flag{
++		&cli.StringSliceFlag{
++			Name:  "addr",
++			Usage: "Camera BLE address (repeat for multiple cameras; comma-separated and case-insensitive substrings are accepted)",
++		},
++		&cli.BoolFlag{
++			Name:  "all",
++			Usage: "Attach to every Insta360 camera discovered during the scan window",
++		},
++		&cli.DurationFlag{
++			Name:  "scan-window",
++			Value: 5 * time.Second,
++			Usage: "How long to scan when --all is used",
++		},
++		&cli.DurationFlag{
++			Name:  "connect-timeout",
++			Value: 30 * time.Second,
++			Usage: "Deadline for discovering and initializing the cameras",
++		},
++	}
++}
++
++// connectMultiManager builds the context, BLE adapter and camera manager.
++// Cleanup disconnects all cameras and the adapter. The returned context is
++// suitable for long-running sessions: the connect deadline only covers the
++// scan/init phase.
++func connectMultiManager(c *cli.Context) (context.Context, *multi.Manager, func(), error) {
++	loggerLevel, err := getLoggerLevel(c)
++	if err != nil {
++		return nil, nil, nil, err
++	}
++
++	ctx := getContext(loggerLevel, false)
++
++	adapter, err := newAdapter(ctx, c)
++	if err != nil {
++		return nil, nil, nil, fmt.Errorf("failed to create BLE adapter: %w", err)
++	}
++
++	connectCtx := ctx
++	if timeout := c.Duration("connect-timeout"); timeout > 0 {
++		var cancel context.CancelFunc
++		connectCtx, cancel = context.WithTimeout(ctx, timeout)
++		defer cancel()
++	}
++
++	mgr, err := multi.Connect(connectCtx, adapter, multi.ConnectOptions{
++		Addrs:       c.StringSlice("addr"),
++		All:         c.Bool("all"),
++		AllWindow:   c.Duration("scan-window"),
++		ScanTimeout: c.Duration("connect-timeout"),
++	})
++	if mgr == nil {
++		_ = adapter.Close(ctx)
++		if err != nil {
++			return nil, nil, nil, err
++		}
++		return nil, nil, nil, fmt.Errorf("no cameras connected")
++	}
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
++	}
++
++	cleanup := func() {
++		mgr.Close(ctx)
++		_ = adapter.Close(ctx)
++	}
++	return ctx, mgr, cleanup, nil
++}
++
++func multiRun(c *cli.Context) error {
++	args := c.Args().Slice()
++	if len(args) == 0 {
++		return fmt.Errorf("usage: insta360ctl multi run [flags] <command> [args...]")
++	}
++
++	name, action, err := resolveMultiAction(args, c.Bool("no-wait"))
++	if err != nil {
++		return err
++	}
++
++	ctx, mgr, cleanup, err := connectMultiManager(c)
++	if err != nil {
++		return err
++	}
++	defer cleanup()
++
++	var fireAt time.Time
++	if delay := c.Duration("delay"); delay > 0 {
++		fmt.Printf("Firing %q in %s...\n", name, delay)
++		fireAt = time.Now().Add(delay)
++	}
++
++	results := mgr.BroadcastAt(ctx, fireAt, action)
++	printMultiResults(name, results)
++
++	s := multi.Summarize(results)
++	if s.Failed > 0 {
++		return fmt.Errorf("%s failed on %d/%d cameras", name, s.Failed, s.Total)
++	}
++	return nil
++}
++
++func multiShell(c *cli.Context) error {
++	ctx, mgr, cleanup, err := connectMultiManager(c)
++	if err != nil {
++		return err
++	}
++	defer cleanup()
++
++	fmt.Println("Connected cameras:")
++	for _, d := range mgr.Devices {
++		fmt.Printf("  %-12s %s (%s)\n", d.Name(), d.Address, d.Model())
++	}
++	fmt.Println(shellHelpText)
++
++	scanner := bufio.NewScanner(os.Stdin)
++	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024)
++
++	for {
++		fmt.Print("x5> ")
++		if !scanner.Scan() {
++			fmt.Println()
++			return nil
++		}
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" {
++			continue
++		}
++
++		fields := strings.Fields(line)
++		cmd := strings.ToLower(fields[0])
++		args := append([]string{cmd}, fields[1:]...)
++
++		switch cmd {
++		case "quit", "exit", "q":
++			return nil
++		case "help", "?":
++			fmt.Println(shellHelpText)
++			continue
++		case "devices":
++			for _, d := range mgr.Devices {
++				fmt.Printf("  %-12s %s (%s)\n", d.Name(), d.Address, d.Model())
++			}
++			continue
++		}
++
++		// Optional trailing delay for start/stop: "start 5s", "record start 5".
++		var fireAt time.Time
++		if cmd == "start" || cmd == "stop" || cmd == "record" {
++			if len(args) >= 2 {
++				if d, ok := tryParseDelay(args[len(args)-1]); ok {
++					args = args[:len(args)-1]
++					fireAt = time.Now().Add(d)
++					fmt.Printf("Firing in %s...\n", d)
++				}
++			}
++		}
++
++		name, action, err := resolveMultiAction(args, false)
++		if err != nil {
++			fmt.Println("error:", err)
++			continue
++		}
++
++		results := mgr.BroadcastAt(ctx, fireAt, action)
++		printMultiResults(name, results)
++	}
++}
++
++func tryParseDelay(s string) (time.Duration, bool) {
++	if s == "" {
++		return 0, false
++	}
++	if n, err := strconv.Atoi(s); err == nil && n > 0 {
++		return time.Duration(n) * time.Second, true
++	}
++	if d, err := time.ParseDuration(s); err == nil && d > 0 {
++		return d, true
++	}
++	return 0, false
++}
++
++// resolveMultiAction maps a command line to a display name and a per-camera
++// action. args[0] is the command itself.
++func resolveMultiAction(args []string, noWait bool) (string, multi.Action, error) {
++	cmd := strings.ToLower(args[0])
++	arg := func(i int) string {
++		if i < len(args) {
++			return args[i]
++		}
++		return ""
++	}
++
++	switch cmd {
++	case "record", "rec":
++		switch strings.ToLower(arg(1)) {
++		case "start":
++			return "record start", recordAction(true, noWait), nil
++		case "stop":
++			return "record stop", recordAction(false, noWait), nil
++		}
++		return "", nil, fmt.Errorf("usage: record <start|stop>")
++	case "start":
++		return "record start", recordAction(true, noWait), nil
++	case "stop":
++		return "record stop", recordAction(false, noWait), nil
++	case "photo", "shutter":
++		return "photo", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.TakePhoto(ctx)
++		}, nil
++	case "marker":
++		return "marker", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.SetHighlight(ctx)
++		}, nil
++	case "timelapse":
++		switch strings.ToLower(arg(1)) {
++		case "start":
++			return "timelapse start", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++				return dev.StartTimelapse(ctx)
++			}, nil
++		case "stop":
++			return "timelapse stop", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++				return dev.StopTimelapse(ctx)
++			}, nil
++		}
++		return "", nil, fmt.Errorf("usage: timelapse <start|stop>")
++	case "mode":
++		if len(args) < 2 {
++			return "", nil, fmt.Errorf("usage: mode <photo|video|timelapse|hdr|bullettime>")
++		}
++		mode, ok := camera.ParseCaptureMode(args[1])
++		if !ok {
++			return "", nil, fmt.Errorf("invalid mode: %s", args[1])
++		}
++		return "mode " + args[1], func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.SetMode(ctx, mode)
++		}, nil
++	case "hdr":
++		var enable bool
++		switch strings.ToLower(arg(1)) {
++		case "on", "true", "1":
++			enable = true
++		case "off", "false", "0":
++			enable = false
++		default:
++			return "", nil, fmt.Errorf("usage: hdr <on|off>")
++		}
++		return "hdr " + arg(1), func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.SetHDR(ctx, enable)
++		}, nil
++	case "gps":
++		if len(args) < 4 {
++			return "", nil, fmt.Errorf("usage: gps <latitude> <longitude> <altitude>")
++		}
++		lat, err := strconv.ParseFloat(args[1], 64)
++		if err != nil {
++			return "", nil, fmt.Errorf("invalid latitude: %w", err)
++		}
++		lon, err := strconv.ParseFloat(args[2], 64)
++		if err != nil {
++			return "", nil, fmt.Errorf("invalid longitude: %w", err)
++		}
++		alt, err := strconv.ParseFloat(args[3], 64)
++		if err != nil {
++			return "", nil, fmt.Errorf("invalid altitude: %w", err)
++		}
++		return "gps", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.InjectGPS(ctx, lat, lon, alt)
++		}, nil
++	case "battery":
++		return "battery", func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			info, err := dev.GetBatteryInfo(ctx)
++			if err != nil {
++				return err
++			}
++			if info.Charging {
++				fmt.Fprintf(out, "battery: %d%% (charging)\n", info.Level)
++			} else {
++				fmt.Fprintf(out, "battery: %d%%\n", info.Level)
++			}
++			return nil
++		}, nil
++	case "storage":
++		return "storage", func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			info, err := dev.GetStorageInfo(ctx)
++			if err != nil {
++				return err
++			}
++			fmt.Fprintf(out, "storage: %dMB free / %dMB total (%d files)\n",
++				info.FreeMB, info.TotalMB, info.FileCount)
++			return nil
++		}, nil
++	case "status":
++		return "status", func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			battery, err := dev.GetBatteryInfo(ctx)
++			if err != nil {
++				fmt.Fprintf(out, "battery: unavailable (%v)\n", err)
++			} else if battery.Charging {
++				fmt.Fprintf(out, "battery: %d%% (charging)\n", battery.Level)
++			} else {
++				fmt.Fprintf(out, "battery: %d%%\n", battery.Level)
++			}
++			storage, err := dev.GetStorageInfo(ctx)
++			if err != nil {
++				fmt.Fprintf(out, "storage: unavailable (%v)\n", err)
++			} else {
++				fmt.Fprintf(out, "storage: %dMB free / %dMB total (%d files)\n",
++					storage.FreeMB, storage.TotalMB, storage.FileCount)
++			}
++			return nil
++		}, nil
++	case "info":
++		return "info", func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			fmt.Fprintf(out, "model: %s, addr: %s\n", dev.Model(), dev.Address)
++			fw, sn, err := dev.GetDeviceInfo(ctx)
++			if err != nil {
++				return fmt.Errorf("device info unavailable: %w", err)
++			}
++			if fw != "" {
++				fmt.Fprintf(out, "firmware: %s\n", fw)
++			}
++			if sn != "" {
++				fmt.Fprintf(out, "serial: %s\n", sn)
++			}
++			return nil
++		}, nil
++	case "state":
++		return "state", func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			resp, err := dev.GetCameraState(ctx)
++			if err != nil {
++				return err
++			}
++			fmt.Fprintf(out, "camera state: %X\n", resp)
++			return nil
++		}, nil
++	case "raw":
++		if len(args) < 2 {
++			return "", nil, fmt.Errorf("usage: raw <cmd-hex> [param-hex ...]")
++		}
++		cmdCode, err := strconv.ParseUint(args[1], 16, 16)
++		if err != nil {
++			return "", nil, fmt.Errorf("invalid command code: %w", err)
++		}
++		var params []byte
++		for i := 2; i < len(args); i++ {
++			b, err := strconv.ParseUint(args[i], 16, 8)
++			if err != nil {
++				return "", nil, fmt.Errorf("invalid param byte: %w", err)
++			}
++			params = append(params, byte(b))
++		}
++		return fmt.Sprintf("raw 0x%02X", cmdCode), func(ctx context.Context, dev *direct.Device, out io.Writer) error {
++			resp, err := dev.SendCommand(ctx, messagecode.Code(cmdCode), params)
++			if err != nil {
++				return err
++			}
++			fmt.Fprintf(out, "response: %X\n", resp)
++			return nil
++		}, nil
++	case "power-off", "poweroff":
++		return "power-off", func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++			return dev.SendCommandNoResponse(ctx, messagecode.CodePowerOff, nil)
++		}, nil
++	default:
++		return "", nil, fmt.Errorf("unknown command %q (see 'help')", args[0])
++	}
++}
++
++func recordAction(start, noWait bool) multi.Action {
++	return func(ctx context.Context, dev *direct.Device, _ io.Writer) error {
++		if noWait {
++			code := messagecode.CodeStopRecording
++			if start {
++				code = messagecode.CodeStartRecording
++			}
++			return dev.SendCommandNoResponse(ctx, code, nil)
++		}
++		if start {
++			return dev.StartRecording(ctx)
++		}
++		return dev.StopRecording(ctx)
++	}
++}
++
++func printMultiResults(command string, results []multi.Result) {
++	fmt.Printf("=== %s ===\n", command)
++
++	base := time.Time{}
++	for _, r := range results {
++		if r.DispatchedAt.IsZero() {
++			continue
++		}
++		if base.IsZero() || r.DispatchedAt.Before(base) {
++			base = r.DispatchedAt
++		}
++	}
++
++	for _, r := range results {
++		dispatch := "n/a"
++		if !r.DispatchedAt.IsZero() {
++			dispatch = "+" + r.DispatchedAt.Sub(base).Round(50*time.Microsecond).String()
++		}
++		rtt := "n/a"
++		if !r.DispatchedAt.IsZero() && !r.FinishedAt.IsZero() {
++			rtt = r.RTT().Round(100 * time.Microsecond).String()
++		}
++		status := "ok"
++		if r.Err != nil {
++			status = "error: " + r.Err.Error()
++		}
++		fmt.Printf("  %-12s %-18s dispatch %-9s rtt %-9s %s\n",
++			r.Device.Name(), r.Device.Address, dispatch, rtt, status)
++		if len(r.Output) > 0 {
++			for _, line := range strings.Split(strings.TrimRight(string(r.Output), "\n"), "\n") {
++				fmt.Printf("      | %s\n", line)
++			}
++		}
++	}
++
++	s := multi.Summarize(results)
++	fmt.Printf("  -- cameras: %d, failed: %d, dispatch spread: %s, max rtt: %s\n",
++		s.Total, s.Failed,
++		s.DispatchSpread.Round(50*time.Microsecond),
++		s.MaxRTT.Round(100*time.Microsecond))
++}
+diff --git a/cmd/insta360ctl/main.go b/cmd/insta360ctl/main.go
+index e09275a..cfd5591 100644
+--- a/cmd/insta360ctl/main.go
++++ b/cmd/insta360ctl/main.go
+@@ -32,6 +32,7 @@ func main() {
+ 		Commands: []*cli.Command{
+ 			cmdScan(),
+ 			cmdDirect(),
++			cmdMulti(),
+ 			cmdRemote(),
+ 			cmdStream(),
+ 			cmdWifi(),
+diff --git a/doc/multi_camera.md b/doc/multi_camera.md
+new file mode 100644
+index 0000000..ffc5060
+--- /dev/null
++++ b/doc/multi_camera.md
+@@ -0,0 +1,110 @@
++# Multi-camera control
++
++The `multi` command set controls several Insta360 cameras from one process
++over a single BLE adapter. It was written for the "two X5" use case but works
++for any mix of BLE-controllable models.
++
++## Why one process instead of two
++
++A one-shot `insta360ctl direct ...` invocation performs the full sequence for
++every command:
++
++```
++scan -> connect -> service discovery -> subscribe -> command -> disconnect
++```
++
++Connection setup takes seconds and varies from run to run. If you trigger two
++processes in parallel, each camera sees a different, unpredictable delay.
++
++`multi` changes the sequence to:
++
++```
++scan -> connect -> initialize              (once, in parallel)
++                    |
++                    +-- shared barrier -> command to all cameras -> report
++                    |
++                    +-- shared barrier -> command to all cameras -> report
++                    ...
++```
++
++All connections stay open. Commands are dispatched after a barrier in which
++every worker is parked, so the residual jitter is only the BLE write path.
++After every broadcast the tool prints per-camera dispatch offsets, round-trip
++times and the overall dispatch spread.
++
++## Commands
++
++```bash
++# One-shot: connect, fire, disconnect
++sudo insta360ctl multi run --addr AA:BB:CC:DD:EE:FF --addr 11:22:33:44:55:66 record start
++sudo insta360ctl multi run --addr AA:BB --addr CC:DD --no-wait record stop
++
++# Scheduled fire (connect first, then fire after the delay)
++sudo insta360ctl multi run --addr AA:BB --addr CC:DD --delay 5s record start
++
++# Interactive session: connections stay open
++sudo insta360ctl multi shell --addr AA:BB --addr CC:DD
++x5> mode video
++x5> start
++x5> start 5s
++x5> stop
++x5> status
++x5> quit
++
++# Attach to every Insta360 camera in range
++sudo insta360ctl multi shell --all --scan-window 5s
++```
++
++Addresses are matched case-insensitively as substrings of the BLE address,
++so a unique suffix is enough. Both `--addr A --addr B` and
++`--addr A,B` work.
++
++`--no-wait` sends Write Without Response and does not wait for the camera
++acknowledgment; it is the lower-latency, lower-reliability option.
++
++## Reading the timing report
++
++```
++=== record start ===
++  X5 A1B2C3    AA:BB:CC:DD:EE:FF  dispatch +0s        rtt 42.1ms   ok
++  X5 D4E5F6    11:22:33:44:55:66  dispatch +1.15ms   rtt 39.8ms   ok
++  -- cameras: 2, failed: 0, dispatch spread: 1.15ms, max rtt: 42.1ms
++```
++
++- **dispatch spread** — the gap between the first and the last camera being
++  handed the command. This is the number the tool can guarantee and improve
++  (typically well under 10ms; often around 1ms with the D-Bus backend and
++  `--no-wait`).
++- **rtt** — time until the camera acknowledgment (or write completion with
++  `--no-wait`). It says nothing about when the sensor actually started.
++
++## What is *not* guaranteed
++
++The BLE command is only the trigger. Once received, each camera runs its own
++pipeline: mode validation, buffer allocation, sensor start, encoding. That
++per-unit internal latency is not observable over BLE and can differ between
++two physically different X5s.
++
++Practical consequences:
++
++1. Treat the dispatch spread as the *lower bound* of the real sync error.
++2. Measure the real offset once, per pair of cameras:
++   - clap once sharply in view of both cameras at recording start
++     (sharp audio transient + visible hands), or wave an LED/phone flash;
++   - align both clips on the transient (audio waveform or first flash frame)
++     in any editor or with a short script.
++3. If the measured offset is stable (same sign and magnitude every take),
++   correct it in post. If it drifts, repeat the measurement per take.
++4. Nothing in the BLE remote protocol provides a timecode or genlock signal;
++   frame-exact sync is a post-processing/external-clocking problem.
++
++## Troubleshooting
++
++- `no cameras found` — check that the cameras are powered on, not connected
++  to the phone app, and that `sudo insta360ctl scan --timeout 10s` lists
++  them.
++- One camera fails to initialize — it may still be bonded to another host or
++  the phone. Power-cycle it and retry.
++- Large dispatch spread (>50ms) — avoid USB 3.0 interference near the
++  adapter, try `--no-wait`, and keep both cameras roughly equidistant from
++  the host.
+diff --git a/pkg/multi/multi.go b/pkg/multi/multi.go
+new file mode 100644
+index 0000000..6ec4a21
+--- /dev/null
++++ b/pkg/multi/multi.go
+@@ -0,0 +1,364 @@
++// Package multi provides simultaneous control of several Insta360 cameras
++// from a single process over one BLE adapter.
++//
++// The package exists because the one-shot CLI flow (scan, connect, command,
++// disconnect) introduces a different connection-setup latency for every
++// camera and every invocation. Multi keeps all BLE connections open and
++// dispatches commands from a shared barrier, so the only remaining jitter is
++// the BLE write itself, which is measured and reported per camera.
++package multi
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"io"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/facebookincubator/go-belt/tool/logger"
++	"github.com/xaionaro-go/insta360ctl/pkg/ble"
++	"github.com/xaionaro-go/insta360ctl/pkg/direct"
++)
++
++// Action is a per-camera operation. Any text the operation wants to report
++// is written to out; the manager prints it after the broadcast so lines from
++// different cameras never interleave.
++type Action func(ctx context.Context, dev *direct.Device, out io.Writer) error
++
++// Result is the outcome of running an action on one camera during a broadcast.
++type Result struct {
++	Device       *direct.Device
++	Output       []byte
++	DispatchedAt time.Time
++	FinishedAt   time.Time
++	Err          error
++}
++
++// RTT returns how long the device call took, from dispatch to return.
++// For commands that wait for an acknowledgment this includes the round trip.
++func (r Result) RTT() time.Duration {
++	return r.FinishedAt.Sub(r.DispatchedAt)
++}
++
++// Summary aggregates a broadcast result set.
++type Summary struct {
++	Total          int
++	Failed         int
++	DispatchSpread time.Duration
++	MaxRTT         time.Duration
++}
++
++// Summarize computes the aggregate statistics for a broadcast.
++func Summarize(results []Result) Summary {
++	s := Summary{Total: len(results)}
++	var minD, maxD time.Time
++	for _, r := range results {
++		if r.Err != nil {
++			s.Failed++
++		}
++		if r.DispatchedAt.IsZero() {
++			continue
++		}
++		if minD.IsZero() || r.DispatchedAt.Before(minD) {
++			minD = r.DispatchedAt
++		}
++		if maxD.IsZero() || r.DispatchedAt.After(maxD) {
++			maxD = r.DispatchedAt
++		}
++		if rtt := r.RTT(); rtt > s.MaxRTT {
++			s.MaxRTT = rtt
++		}
++	}
++	if !minD.IsZero() {
++		s.DispatchSpread = maxD.Sub(minD)
++	}
++	return s
++}
++
++// FanoutResult is the scheduling outcome for one worker of FanOut.
++type FanoutResult struct {
++	Index        int
++	DispatchedAt time.Time
++	FinishedAt   time.Time
++	Err          error
++}
++
++// FanOut runs fn once per index in [0, n), as close to simultaneously as the
++// Go runtime allows. All workers park on a barrier before the gate opens; when
++// fireAt is in the future they additionally wait for that wall-clock moment
++// (coarse sleep plus a short busy-wait for a sharp edge).
++//
++// FanOut is the low-level primitive behind Manager.BroadcastAt; it is
++// exported (and unit-tested separately) so the timing behavior can be
++// verified without any BLE hardware.
++func FanOut(ctx context.Context, n int, fireAt time.Time, fn func(ctx context.Context, i int) error) []FanoutResult {
++	results := make([]FanoutResult, n)
++	if n <= 0 {
++		return results
++	}
++
++	var wg sync.WaitGroup
++	ready := make(chan struct{}, n)
++	gate := make(chan struct{})
++
++	for i := 0; i < n; i++ {
++		i := i
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			results[i].Index = i
++			ready <- struct{}{}
++			<-gate
++
++			if err := ctx.Err(); err != nil {
++				now := time.Now()
++				results[i].DispatchedAt = now
++				results[i].FinishedAt = now
++				results[i].Err = err
++				return
++			}
++
++			if d := time.Until(fireAt); d > 2*time.Millisecond {
++				time.Sleep(d - 2*time.Millisecond)
++			}
++			for time.Now().Before(fireAt) {
++				// Busy-wait the last ~2ms so the dispatch edge stays sharp.
++			}
++
++			results[i].DispatchedAt = time.Now()
++			err := fn(ctx, i)
++			results[i].FinishedAt = time.Now()
++			results[i].Err = err
++		}()
++	}
++
++	for i := 0; i < n; i++ {
++		<-ready // every worker is parked on the gate
++	}
++	close(gate)
++	wg.Wait()
++	return results
++}
++
++// ConnectOptions controls camera discovery and connection.
++type ConnectOptions struct {
++	// Addrs is the list of wanted BLE addresses. Each entry may itself be a
++	// comma-separated list; matching is case-insensitive substring matching,
++	// so a unique suffix of the MAC address is enough.
++	Addrs []string
++
++	// All connects to every Insta360 camera discovered during AllWindow.
++	All bool
++
++	// AllWindow is how long to scan when All is set (default 5s).
++	AllWindow time.Duration
++
++	// ScanTimeout is the overall deadline for discovering Addrs (default 30s).
++	ScanTimeout time.Duration
++}
++
++// Manager holds live BLE connections to multiple cameras.
++type Manager struct {
++	Devices []*direct.Device
++}
++
++// Connect discovers and initializes the requested cameras in parallel.
++//
++// When some cameras fail to initialize but at least one succeeds, Connect
++// returns a non-nil manager (with the cameras that did connect) together
++// with a non-nil error describing the failures, so callers can decide
++// between continuing with a partial set or aborting.
++func Connect(ctx context.Context, adapter ble.Adapter, opts ConnectOptions) (*Manager, error) {
++	wanted := make([]string, 0, len(opts.Addrs))
++	seenWant := map[string]bool{}
++	for _, a := range opts.Addrs {
++		for _, part := range strings.Split(a, ",") {
++			part = strings.ToLower(strings.TrimSpace(part))
++			if part == "" || seenWant[part] {
++				continue
++			}
++			seenWant[part] = true
++			wanted = append(wanted, part)
++		}
++	}
++	if len(wanted) == 0 && !opts.All {
++		return nil, fmt.Errorf("no camera addresses given (use --addr, or --all)")
++	}
++	if opts.AllWindow <= 0 {
++		opts.AllWindow = 5 * time.Second
++	}
++	if opts.ScanTimeout <= 0 {
++		opts.ScanTimeout = 30 * time.Second
++	}
++
++	scanCtx, cancelScan := context.WithCancel(ctx)
++
++	devCh, errCh := direct.Scan(scanCtx, adapter)
++
++	matched := make(map[string]*direct.Device, len(wanted))
++	var allDevs []*direct.Device
++	assigned := map[string]bool{}
++
++	var allC <-chan time.Time
++	if opts.All {
++		t := time.NewTimer(opts.AllWindow)
++		defer t.Stop()
++		allC = t.C
++	}
++	timeoutC := time.NewTimer(opts.ScanTimeout)
++	defer timeoutC.Stop()
++
++scanLoop:
++	for {
++		if !opts.All && len(matched) == len(wanted) {
++			break
++		}
++		select {
++		case dev, ok := <-devCh:
++			if !ok {
++				devCh = nil // scan ended; nothing more will arrive
++				continue
++			}
++			if dev == nil {
++				continue
++			}
++			if opts.All {
++				allDevs = append(allDevs, dev)
++				assigned[dev.Address] = true
++				continue
++			}
++			for _, w := range wanted {
++				if _, ok := matched[w]; ok {
++					continue
++				}
++				if !strings.Contains(strings.ToLower(dev.Address), w) {
++					continue
++				}
++				if assigned[dev.Address] {
++					continue
++				}
++				matched[w] = dev
++				assigned[dev.Address] = true
++				logger.Infof(ctx, "matched %q to %s", w, dev)
++				break
++			}
++		case err := <-errCh:
++			if err != nil {
++				cancelScan()
++				return nil, fmt.Errorf("scan failed: %w", err)
++			}
++			errCh = nil
++		case <-allC:
++			break scanLoop
++		case <-timeoutC.C:
++			break scanLoop
++		case <-ctx.Done():
++			cancelScan()
++			return nil, ctx.Err()
++		}
++	}
++
++	// Stop scanning before opening GATT connections: concurrent discovery
++	// slows connection setup down and is not needed anymore.
++	cancelScan()
++	_ = adapter.StopScan()
++
++	var devs []*direct.Device
++	var missing []string
++	if opts.All {
++		devs = allDevs
++	} else {
++		for _, w := range wanted {
++			if d, ok := matched[w]; ok {
++				devs = append(devs, d)
++			} else {
++				missing = append(missing, w)
++			}
++		}
++	}
++	if len(devs) == 0 {
++		if len(missing) > 0 {
++			return nil, fmt.Errorf("no cameras found (missing: %s)", strings.Join(missing, ", "))
++		}
++		return nil, fmt.Errorf("no cameras found")
++	}
++
++	var wg sync.WaitGroup
++	initErrs := make([]error, len(devs))
++	for i := range devs {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			if err := devs[i].Init(ctx); err != nil {
++				initErrs[i] = fmt.Errorf("%s (%s): %w", devs[i].Name(), devs[i].Address, err)
++			}
++		}(i)
++	}
++	wg.Wait()
++
++	var ready []*direct.Device
++	var failures []string
++	for i, d := range devs {
++		if initErrs[i] != nil {
++			failures = append(failures, initErrs[i].Error())
++			_ = d.Close(ctx)
++			continue
++		}
++		ready = append(ready, d)
++	}
++	for _, w := range missing {
++		failures = append(failures, fmt.Sprintf("%s: not found during scan", w))
++	}
++
++	m := &Manager{Devices: ready}
++	if len(ready) == 0 {
++		return nil, fmt.Errorf("failed to initialize any camera: %s", strings.Join(failures, "; "))
++	}
++	if len(failures) > 0 {
++		return m, fmt.Errorf("some cameras failed: %s", strings.Join(failures, "; "))
++	}
++	return m, nil
++}
++
++// Broadcast runs action on every camera as simultaneously as possible.
++func (m *Manager) Broadcast(ctx context.Context, action Action) []Result {
++	return m.BroadcastAt(ctx, time.Time{}, action)
++}
++
++// BroadcastAt is Broadcast with a scheduled fire time. A zero fireAt means
++// "fire now". All cameras are dispatched after a shared barrier, so the
++// reported dispatch spread is dominated by the BLE stack, not by connection
++// setup.
++func (m *Manager) BroadcastAt(ctx context.Context, fireAt time.Time, action Action) []Result {
++	n := len(m.Devices)
++	outs := make([][]byte, n)
++	rs := FanOut(ctx, n, fireAt, func(ctx context.Context, i int) error {
++		var buf bytes.Buffer
++		err := action(ctx, m.Devices[i], &buf)
++		outs[i] = buf.Bytes()
++		return err
++	})
++
++	results := make([]Result, n)
++	for i := range rs {
++		results[i] = Result{
++			Device:       m.Devices[i],
++			Output:       outs[i],
++			DispatchedAt: rs[i].DispatchedAt,
++			FinishedAt:   rs[i].FinishedAt,
++			Err:          rs[i].Err,
++		}
++	}
++	return results
++}
++
++// Close disconnects from every camera; errors are logged, not returned.
++func (m *Manager) Close(ctx context.Context) {
++	for _, d := range m.Devices {
++		if err := d.Close(ctx); err != nil {
++			logger.Warnf(ctx, "failed to disconnect %s (%s): %v", d.Name(), d.Address, err)
++		}
++	}
++}
+diff --git a/pkg/multi/multi_test.go b/pkg/multi/multi_test.go
+new file mode 100644
+index 0000000..320e359
+--- /dev/null
++++ b/pkg/multi/multi_test.go
+@@ -0,0 +1,85 @@
++package multi
++
++import (
++	"context"
++	"fmt"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestFanOutFiresAllAtDeadline(t *testing.T) {
++	const n = 6
++	fireAt := time.Now().Add(40 * time.Millisecond)
++
++	var calls int64
++	results := FanOut(context.Background(), n, fireAt, func(ctx context.Context, i int) error {
++		atomic.AddInt64(&calls, 1)
++		if i == 2 {
++			return fmt.Errorf("camera %d failed", i)
++		}
++		return nil
++	})
++
++	require.EqualValues(t, n, atomic.LoadInt64(&calls))
++	require.Len(t, results, n)
++	require.Error(t, results[2].Err)
++	require.NoError(t, results[0].Err)
++
++	var minD, maxD time.Time
++	for _, r := range results {
++		require.False(t, r.DispatchedAt.IsZero(), "result %d was never dispatched", r.Index)
++		require.False(t, r.DispatchedAt.Before(fireAt),
++			"result %d dispatched at %v, before fireAt %v", r.Index, r.DispatchedAt, fireAt)
++		require.False(t, r.FinishedAt.Before(r.DispatchedAt))
++		if minD.IsZero() || r.DispatchedAt.Before(minD) {
++			minD = r.DispatchedAt
++		}
++		if maxD.IsZero() || r.DispatchedAt.After(maxD) {
++			maxD = r.DispatchedAt
++		}
++	}
++	spread := maxD.Sub(minD)
++	require.Less(t, spread, 15*time.Millisecond, "dispatch spread too large: %v", spread)
++}
++
++func TestFanOutZeroFireAt(t *testing.T) {
++	results := FanOut(context.Background(), 3, time.Time{}, func(ctx context.Context, i int) error {
++		return nil
++	})
++	require.Len(t, results, 3)
++	for _, r := range results {
++		require.NoError(t, r.Err)
++		require.False(t, r.DispatchedAt.IsZero())
++	}
++}
++
++func TestFanOutHonorsCancelledContext(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	results := FanOut(ctx, 2, time.Time{}, func(ctx context.Context, i int) error {
++		t.Fatal("action must not run on a cancelled context")
++		return nil
++	})
++	require.Len(t, results, 2)
++	for _, r := range results {
++		require.ErrorIs(t, r.Err, context.Canceled)
++	}
++}
++
++func TestSummarize(t *testing.T) {
++	now := time.Now()
++	results := []Result{
++		{DispatchedAt: now, FinishedAt: now.Add(5 * time.Millisecond)},
++		{DispatchedAt: now.Add(2 * time.Millisecond), FinishedAt: now.Add(20 * time.Millisecond)},
++		{DispatchedAt: now, FinishedAt: now, Err: fmt.Errorf("boom")},
++	}
++	s := Summarize(results)
++	require.Equal(t, 3, s.Total)
++	require.Equal(t, 1, s.Failed)
++	require.Equal(t, 2*time.Millisecond, s.DispatchSpread)
++	require.Equal(t, 18*time.Millisecond, s.MaxRTT)
++}
+-- 
+2.34.1
+

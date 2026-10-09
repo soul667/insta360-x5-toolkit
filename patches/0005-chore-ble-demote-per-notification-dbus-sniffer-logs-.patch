@@ -1,0 +1,29 @@
+From d69f0de8c26f1afb1f93f8912cce5ea9bbe14f36 Mon Sep 17 00:00:00 2001
+From: ShengzheGAN <shengzhegan04@gmail.com>
+Date: Fri, 9 Oct 2026 15:29:41 +0800
+Subject: [PATCH 5/5] chore(ble): demote per-notification dbus sniffer logs to
+ debug
+
+The sniffer logs every PropertiesChanged signal on the system bus at INFO
+level, which floods the terminal when the web console runs for a while
+(the camera sends 1Hz keep-alives per connection).
+---
+ pkg/ble/dbus.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/pkg/ble/dbus.go b/pkg/ble/dbus.go
+index 4788983..c32e591 100644
+--- a/pkg/ble/dbus.go
++++ b/pkg/ble/dbus.go
+@@ -78,7 +78,7 @@ func dbusSignalSniffer(ctx context.Context) {
+ 					changes, _ := sig.Body[1].(map[string]dbus.Variant)
+ 					if val, ok := changes["Value"]; ok {
+ 						data, _ := val.Value().([]byte)
+-						logger.Infof(ctx, "[dbus-sniffer] CHARACTERISTIC VALUE CHANGED: path=%s data=%X", sig.Path, data)
++						logger.Debugf(ctx, "[dbus-sniffer] CHARACTERISTIC VALUE CHANGED: path=%s data=%X", sig.Path, data)
+ 					} else {
+ 						logger.Debugf(ctx, "[dbus-sniffer] characteristic property changed: path=%s changes=%v", sig.Path, changes)
+ 					}
+-- 
+2.34.1
+

@@ -1,0 +1,5 @@
+clips/
+*.insv
+__pycache__/
+*.pyc
+bin/
