@@ -1,0 +1,37 @@
+From ba3aae381592f6fba159c20a276ba1825b822648 Mon Sep 17 00:00:00 2001
+From: ShengzheGAN <shengzhegan04@gmail.com>
+Date: Fri, 9 Oct 2026 22:48:59 +0800
+Subject: [PATCH] docs: document the tested dual-X5 setup and web-console
+ startup
+
+Adds the concrete BLE addresses of the two test cameras and the exact
+multi shell / multi serve commands (web console on http://127.0.0.1:8787).
+---
+ README.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/README.md b/README.md
+index 4d3f825..b6497bb 100644
+--- a/README.md
++++ b/README.md
+@@ -99,6 +99,17 @@ Connections stay open for the whole session, so commands reach every camera
+ within the reported dispatch spread (typically single-digit milliseconds
+ with the D-Bus backend).
+ 
++**Tested dual-X5 setup (this fork):** X5 53F3TQ at `f0:23:ae:62:6c:a0` and
++X5 6JDF89 at `f0:23:ae:76:ef:6e`:
++
++```bash
++# Interactive session (both cameras, synchronized start/stop)
++sudo insta360ctl multi shell --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
++
++# Local web console (Record/Stop buttons) -> http://127.0.0.1:8787
++sudo insta360ctl multi serve --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
++```
++
+ ```bash
+ # One command for all cameras; prints per-camera dispatch offsets and RTTs
+ sudo insta360ctl multi run --addr AA:BB:CC:DD:EE:FF --addr 11:22:33:44:55:66 record start
+-- 
+2.34.1
+

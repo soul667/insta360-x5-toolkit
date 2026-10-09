@@ -30,6 +30,7 @@ git am --3way patches/0001-*.patch   # etc.
 | `0003` | `stop` prints the recorded file path (X5 ACK body) — proof of recording and a second-level clock-offset readout |
 | `0004` | `multi serve`: local web console (Record/Stop/Photo/Marker buttons, timing, clock-diff) |
 | `0005` | Demote per-notification D-Bus sniffer logs from INFO to DEBUG |
+| `0006` | Document the tested dual-X5 setup (concrete camera addresses) and the web console startup in the README |
 
 ## Verified behavior
 

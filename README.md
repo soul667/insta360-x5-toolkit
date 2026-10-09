@@ -36,7 +36,7 @@ Insta360 X5 的 BLE 直控协议与旧机型（X3/X4 的 16 字节头）**完全
 
 ### 1. 构建增强版 insta360ctl
 
-上游 [xaionaro-go/insta360ctl](https://github.com/xaionaro-go/insta360ctl) 未附许可证，本项目以补丁形式提供修改：
+上游 [xaionaro-go/insta360ctl](https://github.com/xaionaro-go/insta360ctl) 未附许可证，本项目以 6 个补丁的形式提供修改：
 
 ```bash
 git clone https://github.com/xaionaro-go/insta360ctl.git
@@ -56,6 +56,49 @@ sudo bin/insta360ctl scan --timeout 10s
 ```
 
 ### 3. 双机同步录制
+
+**实测设备（本项目使用的两台 X5）**：
+
+| 相机 | BLE 地址 |
+|---|---|
+| X5 53F3TQ | `f0:23:ae:62:6c:a0` |
+| X5 6JDF89 | `f0:23:ae:76:ef:6e` |
+
+连接这两台的完整命令：
+
+```bash
+# 1) 交互式会话：两台同时开录/停止，打印派发差与文件名
+sudo bin/insta360ctl multi shell --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
+
+# 2) 网页前端：浏览器里点击"开始录制/停止录制"
+sudo bin/insta360ctl multi serve --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
+```
+
+#### 启动网页前端（multi serve）
+
+```bash
+sudo bin/insta360ctl multi serve --addr f0:23:ae:62:6c:a0 --addr f0:23:ae:76:ef:6e
+# 输出: Dual-camera web console: http://127.0.0.1:8787
+```
+
+然后用浏览器打开 **http://127.0.0.1:8787**。页面功能：
+
+| 元素 | 说明 |
+|---|---|
+| ● 开始录制 / ■ 停止录制 | 两台相机同步触发；录制中"开始"自动禁用 |
+| 📷 拍照 / 🚩 高亮标记 | 双机同步执行 |
+| 启动延迟（秒） | 例如填 3：3 秒后触发，方便先摆好手 |
+| 每次操作显示 | 每台的派发偏移、RTT、成功/失败；**停止时显示各自文件名和两台时钟差** |
+| 状态 | 每秒自动刷新，顶部显示已连接相机列表 |
+
+常用参数：
+
+- 手机/平板访问：`--listen 0.0.0.0:8787`（局域网内可见，无鉴权，谨慎使用）
+- 端口被占用：`--listen 127.0.0.1:8788`
+- 该命令是常驻进程：**保持终端不要关**；结束用 `Ctrl+C`
+- 相机无操作数分钟会自动关机，届时前端会显示失败——重新开机相机后重启 `multi serve` 即可
+
+#### 通用示例（地址换成你自己的）
 
 ```bash
 # 交互式会话（推荐；连接只建立一次，后续发令抖动最小）
