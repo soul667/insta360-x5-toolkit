@@ -27,6 +27,7 @@ Insta360 X5 的 BLE 直控协议与旧机型（X3/X4 的 16 字节头）**完全
 | X5 网络帧协议 | `ProtoFormatNetwork` 实现（发送/接收/重组/应答匹配/心跳/握手） | `patches/` |
 | 网页控制台 | `multi serve`：录制/停止/拍照/标记，实时显示时钟差与录制文件名 | `patches/` |
 | 协议探针 | `x5probe`：原始帧收发与通知解析（继续逆向用） | `patches/` |
+| **安卓 App** | 手机端双机遥控：扫描/连接/同步录制/时钟差，Kotlin + Jetpack Compose | `android/` |
 | 帧偏移校验 | 拍手/瞬态事件 → 毫秒/帧级偏移 | `tools/sync_check.py` |
 | 相机时钟读写 | 通过官方 OSC API 读取/尝试写入 `_dateTime` | `tools/osc_settime.py` |
 | 双机时钟校准 | 一键：开热点 → 连 AP → 校准 → 恢复网络 | `tools/osc_timesync.sh` |
@@ -162,6 +163,22 @@ python3 tools/sync_check.py A.mp4 B.mp4 --fps 30
 ./tools/fetch_clips.sh 2      # 每台拉最近 2 个文件到 ./clips/
 ```
 
+### 6. 安卓 App（可选）
+
+`android/` 是用手机控制两台 X5 的原生安卓应用，功能与网页前端一致（BLE 直连、屏障式同步发令、时钟差显示）。
+
+- **直接安装**：下载 [`android/releases/X5Remote-v0.1.0-debug.apk`](android/releases/X5Remote-v0.1.0-debug.apk) 传到手机点击安装（允许未知来源），或 `adb install android/releases/X5Remote-v0.1.0-debug.apk`
+- **自行构建**：`cd android && ./gradlew assembleDebug`
+- **GitHub Packages（Maven 仓库）**：
+  - 坐标：`com.soul667:x5remote:0.1.0`（`apk` 打包类型）
+  - 仓库地址：`https://maven.pkg.github.com/soul667/insta360-x5-toolkit`
+  - 下载（需带 GitHub token 的 Basic 认证，`read:packages` 权限）：
+    ```bash
+    curl -L -u soul667:<TOKEN> \
+      https://maven.pkg.github.com/soul667/insta360-x5-toolkit/com/soul667/x5remote/0.1.0/x5remote-0.1.0.apk -o X5Remote.apk
+    ```
+- 首次运行需授予蓝牙权限；相机需开机（X5 自动关机后需重新开机）
+
 ## 已知限制
 
 - **未实现的 X5 查询/设置**：电量、存储、设备信息、拍摄模式切换、HDR 开关。对应命令码在 X5 上语义不同或需要 protobuf 请求体；代码显式拒绝而不是乱发（`mode`/`hdr` 会报"暂不支持"）。
@@ -187,6 +204,8 @@ insta360-x5-toolkit/
     └── fetch_clips.sh        # WiFi 素材拉取
 ```
 
+（另有 `android/` 安卓工程与预编译 APK，见上。）
+
 ## English
 
 **Linux toolkit for synchronized dual Insta360 X5 control.** The X5 does **not** use the
@@ -201,6 +220,10 @@ legacy 16-byte header protocol; it speaks the WiFi/TCP control protocol framing 
 - `docs/sync-verification.md` — timecode alignment and frame-offset verification methodology.
 - `tools/` — frame-offset checker (`sync_check.py`), OSC clock read/write (`osc_settime.py`),
   two-camera clock calibration (`osc_timesync.sh`), clip download over WiFi (`fetch_clips.sh`).
+- `android/` — a native Android app (Kotlin + Jetpack Compose) with the same
+  scan/connect/synchronized-record workflow; a prebuilt debug APK lives in
+  `android/releases/`, and the APK is also published to GitHub Packages
+  (`com.soul667:x5remote:0.1.0`).
 
 Build: apply the patches to a fresh clone of the upstream repo (`git am patches/*.patch`),
 then `go build ./cmd/insta360ctl`. Run `scan`, then `multi shell --addr <A> --addr <B>`
